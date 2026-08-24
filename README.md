@@ -76,14 +76,14 @@ The code can be found in repo: Universal controller code
 
 | Item | Quantity | Price (USD) | Link |
 | :--- | :--- | :--- | :--- |
-| ESP32 30 Pin Expansion Board | 1 | 8.68 USD | https://www.ardboard.com/index.php?route=product/product&product_id=413 |
-| Dual 2-Axis Joystick Module | 1 | 4.60 USD | https://elimex.bg/product/74876-kit-k2125-modul-ps2-dzhoystik-za-avrpic-i-dr |
-| 0.96 Oled Display | 1 | 5.60 USD | https://www.ardboard.com/index.php?route=product/product&product_id=264&search=oled |
+| ESP32 30 Pin Expansion Board | 1 | 8.90 USD | https://www.ardboard.com/index.php?route=product/product&product_id=413 |
+| Dual 2-Axis Joystick Module | 1 | 1.73 USD | https://elimex.bg/product/74876-kit-k2125-modul-ps2-dzhoystik-za-avrpic-i-dr |
+| 0.96 Oled Display | 1 | 5.74 USD | https://www.ardboard.com/index.php?route=product/product&product_id=264&search=oled |
 | Pushbutton (L2, R2, Mode, Menu) | 4 | 0.12 USD x4 = 0.48 USD | https://elimex.bg/product/85908-mikrobuton-12-12-7.5-kan1211 |
 | 3mm LED (Blue, Green, White) | 1 | 0.12 USD | https://elimex.bg/product/59013-led-8mm-diff-green |
 | Jumper Cables | ~30 | 5.77 USD x2 = 11.54 USD | [https://elimex.bg/product/85664-akumulator-3.7v-3400mah-lc18650-lav](https://elimex.bg/product/75823-komplekt-provodnitsi-40-broya-s-konektori-mazhki-zhenski-30sm AND https://elimex.bg/product/74894-komplekt-provodnitsi-40-broya-s-konektori-mazhki-mazhki-20sm)a |
-| LoRa | 1 | 0.28 USD x4 = 1.12 USD | https://www.ardboard.com/lora-ra-02-433MHz?search=LoRa |
-| 18650 battery | 1 | 1.52 USD | https://elimex.bg/product/85664-akumulator-3.7v-3400mah-lc18650-lava |
+| LoRa | 1 | 11.17 USD | https://www.ardboard.com/lora-ra-02-433MHz?search=LoRa |
+| 18650 battery | 1 | 5.91 USD | https://elimex.bg/product/85664-akumulator-3.7v-3400mah-lc18650-lava |
 | Power Switch | 1 | 0.35 USD | https://elimex.bg/product/44024-switch-smrs101-1-black | 
 | TP4056 | 1 | 1.73 USD | https://elimex.bg/product/92572-kit-k645-zariadno-za-li-ion-baterii-s-usb-micro | 
 
