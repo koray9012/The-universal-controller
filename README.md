@@ -2,7 +2,7 @@
 
                                   The universal controller
                                           By Koray                                                                                                  
-![image alt](https://github.com/koray9012/Edge-detecting-robot-2.0/blob/main/15409.jpg?raw=true)
+![image](https://raw.githubusercontent.com/koray9012/The-universal-controller/refs/heads/main/20260823_182458.jpg)
 The Universal Controller is a custom-built, dual-joystick ESP32 handheld transmitter engineered for low-latency wireless hardware control via ESP-NOW. Built with real-time OLED telemetry feedback, customizable mode toggles, and fail-safe link monitoring, it acts as a modular remote platform for driving 4WD rovers and controlling their functions,
 
 ## Key Upgrades & Features
