@@ -1,0 +1,183 @@
+#include <WiFi.h>
+#include <esp_now.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// --- LORA LIBRARIES & DEFINITIONS (PREPARED FOR EXPANSION) ---
+// #include <SPI.h>
+// #include <LoRa.h>
+// #define LORA_SCK  18
+// #define LORA_MISO 19
+// #define LORA_MOSI 23
+// #define LORA_SS   5
+// #define LORA_RST  14
+// #define LORA_DIO0 2
+
+// --- HARDWARE PINS ---
+#define PIN_JOY_L_X  32  // Left Joystick Horizontal (Steering)
+#define PIN_BTN_TL   4   // L2 Trigger (Drive Backward / Stop)
+#define PIN_BTN_TR   13  // R2 Trigger (Drive Forward)
+#define PIN_BTN_MODE 25  
+#define PIN_BTN_MENU 27  
+
+#define PIN_LED_TX   2   // Blue LED
+#define PIN_LED_PWR  17  // Green LED
+#define PIN_LED_DIAG 16  // White LED
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// --- ESP-NOW MESSAGES ---
+struct CommandMessage {
+  char cmd[16];
+};
+
+struct IdentityMessage {
+  char name[32];
+};
+
+CommandMessage outgoingCmd;
+IdentityMessage connectedRobot;
+
+uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+bool espNowSuccess = false;
+unsigned long lastResponseTime = 0;
+char robotName[32] = "SEARCHING...";
+
+void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  espNowSuccess = (status == ESP_NOW_SEND_SUCCESS);
+  digitalWrite(PIN_LED_TX, espNowSuccess ? HIGH : LOW);
+}
+
+void OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingData, int len) {
+  if (len == sizeof(IdentityMessage)) {
+    memcpy(&connectedRobot, incomingData, sizeof(connectedRobot));
+    strncpy(robotName, connectedRobot.name, sizeof(robotName));
+    lastResponseTime = millis();
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(PIN_LED_TX, OUTPUT);
+  pinMode(PIN_LED_PWR, OUTPUT);
+  pinMode(PIN_LED_DIAG, OUTPUT);
+
+  digitalWrite(PIN_LED_PWR, HIGH);
+
+  pinMode(PIN_BTN_TL, INPUT_PULLUP);
+  pinMode(PIN_BTN_TR, INPUT_PULLUP);
+  pinMode(PIN_BTN_MODE, INPUT_PULLUP);
+  pinMode(PIN_BTN_MENU, INPUT_PULLUP);
+
+  Wire.begin(21, 22);
+  if (display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 10);
+    display.println("CONTROLLER READY");
+    display.display();
+  }
+
+  WiFi.mode(WIFI_STA);
+  if (esp_now_init() == ESP_OK) {
+    esp_now_register_send_cb(OnDataSent);
+    esp_now_register_recv_cb(OnDataRecv);
+
+    esp_now_peer_info_t peerInfo = {};
+    memcpy(peerInfo.peer_addr, broadcastAddress, 6);
+    peerInfo.channel = 0;  
+    peerInfo.encrypt = false;
+    
+    esp_now_add_peer(&peerInfo);
+  }
+
+  // --- LORA INITIALIZATION CODE (UNCOMMENT WHEN LORA MODULE ATTACHED) ---
+  /*
+  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_SS);
+  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
+  if (LoRa.begin(915E6)) { 
+    digitalWrite(PIN_LED_DIAG, HIGH); // White LED indicates LoRa initialization status
+    Serial.println("LoRa Radio Initialized!");
+  } else {
+    Serial.println("LoRa Initialization Failed!");
+  }
+  */
+}
+
+void loop() {
+  // Read Triggers
+  bool r2Pressed = (digitalRead(PIN_BTN_TR) == LOW); // Forward
+  bool l2Pressed = (digitalRead(PIN_BTN_TL) == LOW); // Backward
+
+  // Read Left Joystick VRx (GPIO 32)
+  int lxRaw = analogRead(PIN_JOY_L_X);
+  int deadzone = 800;
+  int lx = lxRaw - 2048;
+
+  bool steeringLeft = (lx < -deadzone);
+  bool steeringRight = (lx > deadzone);
+
+  // Simple string-based state construction
+  String cmdStr = "STOP";
+
+  if (r2Pressed && !l2Pressed) {
+    if (steeringLeft) cmdStr = "FORWARD_LEFT";
+    else if (steeringRight) cmdStr = "FORWARD_RIGHT";
+    else cmdStr = "FORWARD";
+  } 
+  else if (l2Pressed && !r2Pressed) {
+    if (steeringLeft) cmdStr = "BACK_LEFT";
+    else if (steeringRight) cmdStr = "BACK_RIGHT";
+    else cmdStr = "BACK";
+  } 
+  else if (steeringLeft) {
+    cmdStr = "LEFT";
+  } 
+  else if (steeringRight) {
+    cmdStr = "RIGHT";
+  }
+
+  cmdStr.toCharArray(outgoingCmd.cmd, sizeof(outgoingCmd.cmd));
+
+  // Send simplified message over ESP-NOW
+  esp_now_send(broadcastAddress, (uint8_t *)&outgoingCmd, sizeof(outgoingCmd));
+
+  // --- OPTIONAL LORA BROADCAST (UNCOMMENT WHEN MODULE ADDED) ---
+  /*
+  LoRa.beginPacket();
+  LoRa.write((uint8_t *)&outgoingCmd, sizeof(outgoingCmd));
+  LoRa.endPacket();
+  */
+
+  if (millis() - lastResponseTime > 2000) {
+    strcpy(robotName, "SEARCHING...");
+  }
+
+  // Display Status
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  
+  display.setCursor(0, 0);
+  display.println("CONNECTED TO:");
+
+  display.setCursor(0, 14);
+  display.println(robotName);
+
+  display.setCursor(0, 32);
+  display.print("CMD: ");
+  display.println(outgoingCmd.cmd);
+
+  display.setCursor(0, 48);
+  display.print("ESP-NOW: ");
+  display.println(espNowSuccess ? "LINK OK" : "NO LINK");
+
+  display.display();
+
+  delay(30);
+}
