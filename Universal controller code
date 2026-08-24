@@ -1,183 +1,304 @@
 #include <WiFi.h>
-#include <esp_now.h>
+#include <WebServer.h>
+#include <ESP32Servo.h>
+#include <SPI.h>
+#include <LoRa.h>
+#include <TinyGPS++.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
-// --- LORA LIBRARIES & DEFINITIONS (PREPARED FOR EXPANSION) ---
-// #include <SPI.h>
-// #include <LoRa.h>
-// #define LORA_SCK  18
-// #define LORA_MISO 19
-// #define LORA_MOSI 23
-// #define LORA_SS   5
-// #define LORA_RST  14
-// #define LORA_DIO0 2
+// --- System Pin Mapping & Configurations ---
+#define ENA             14
+#define IN1             27
+#define IN2             26
+#define IN3             25
+#define IN4             33
+#define BUTTON_PIN      4
+#define BUZZER_PIN      19
 
-// --- HARDWARE PINS ---
-#define PIN_JOY_L_X  32  // Left Joystick Horizontal (Steering)
-#define PIN_BTN_TL   4   // L2 Trigger (Drive Backward / Stop)
-#define PIN_BTN_TR   13  // R2 Trigger (Drive Forward)
-#define PIN_BTN_MODE 25  
-#define PIN_BTN_MENU 27  
+// Servo Array Pins (4 Servos for Solar Panel Articulation & Gimbal Gimicks)
+#define SERVO_PANEL_1   13
+#define SERVO_PANEL_2   12
+#define SERVO_GIMBAL_H  23
+#define SERVO_GIMBAL_V  18
 
-#define PIN_LED_TX   2   // Blue LED
-#define PIN_LED_PWR  17  // Green LED
-#define PIN_LED_DIAG 16  // White LED
+// GPS Module (GP-01 BDS+GPS) Hardware Serial 2
+#define GPS_RX          16
+#define GPS_TX          17
 
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 64
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+// LoRa SPI Bus Pin Mapping
+#define LORA_SCK        5
+#define LORA_MISO       19
+#define LORA_MOSI       27
+#define LORA_SS         18
+#define LORA_RST        14
+#define LORA_DIO0       26
 
-// --- ESP-NOW MESSAGES ---
-struct CommandMessage {
-  char cmd[16];
-};
+// OLED Display Specs
+#define SCREEN_WIDTH    128
+#define SCREEN_HEIGHT   64
+#define OLED_RESET      -1
+#define SCREEN_ADDRESS  0x3C
 
-struct IdentityMessage {
-  char name[32];
-};
+// --- Global Objects ---
+WebServer server(80);
+TinyGPSPlus gps;
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-CommandMessage outgoingCmd;
-IdentityMessage connectedRobot;
+Servo panelServo1;
+Servo panelServo2;
+Servo gimbalHServo;
+Servo gimbalVServo;
 
-uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-bool espNowSuccess = false;
-unsigned long lastResponseTime = 0;
-char robotName[32] = "SEARCHING...";
+// --- State Machine & Telemetry Variables ---
+int currentMode = 0; // 0: Auto, 1: Manual+Safety, 2: Suicide, 3: Diagnostics
+unsigned long lastButtonPress = 0;
+bool lastButtonState = HIGH;
 
-void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
-  espNowSuccess = (status == ESP_NOW_SEND_SUCCESS);
-  digitalWrite(PIN_LED_TX, espNowSuccess ? HIGH : LOW);
+int panelPos1 = 0;
+int panelPos2 = 0;
+int gimbalHPos = 90;
+int gimbalVPos = 90;
+
+unsigned long previousTelemetryMillis = 0;
+const long telemetryInterval = 2000;
+
+// --- Embedded Web Dashboard UI (Full HTML/CSS/JS Payload) ---
+const char MAIN_PAGE[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Mars Rover Full Command Hub</title>
+  <style>
+    body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; text-align: center; background: #0f172a; color: #f8fafc; margin: 0; padding: 15px; }
+    h2 { color: #38bdf8; margin-bottom: 5px; letter-spacing: 1px; }
+    .container { max-width: 450px; margin: auto; }
+    .panel-box { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 12px; margin-top: 12px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.3); }
+    .btn { background: #0ea5e9; color: white; padding: 14px 20px; font-size: 16px; font-weight: bold; margin: 6px; border: none; border-radius: 8px; cursor: pointer; width: 42%; transition: background 0.2s; }
+    .btn:active { background: #0284c7; }
+    .stop { background: #ef4444; width: 88%; }
+    .stop:active { background: #dc2626; }
+    .servo-btn { background: #10b981; width: 42%; }
+    .servo-btn:active { background: #059669; }
+    .status { background: #090d16; border: 1px solid #1e293b; padding: 14px; border-radius: 8px; margin-top: 15px; font-family: 'Courier New', Courier, monospace; font-size: 13px; text-align: left; color: #38bdf8; line-height: 1.4; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h2>MARS ROVER 2.0 HUD</h2>
+    <p style="font-size: 12px; color: #94a3b8;">ESP32 Advanced Telemetry & Motion Control</p>
+    
+    <div class="panel-box">
+      <h3>Drive Control</h3>
+      <button class="btn" onclick="sendCommand('forward')">▲ FWD</button><br>
+      <button class="btn" onclick="sendCommand('left')">◄ LEFT</button>
+      <button class="btn" onclick="sendCommand('right')">RIGHT ►</button><br>
+      <button class="btn" onclick="sendCommand('backward')">▼ REV</button><br><br>
+      <button class="btn stop" onclick="sendCommand('stop')">🛑 EMERGENCY STOP</button>
+    </div>
+
+    <div class="panel-box">
+      <h3>Solar Array & Gimbal Articulation</h3>
+      <button class="btn servo-btn" onclick="sendCommand('panel_up')">Panel Up (+)</button>
+      <button class="btn servo-btn" onclick="sendCommand('panel_down')">Panel Down (-)</button><br>
+      <button class="btn servo-btn" onclick="sendCommand('gimbal_left')">Gimbal ◄</button>
+      <button class="btn servo-btn" onclick="sendCommand('gimbal_right')">Gimbal ►</button>
+    </div>
+
+    <div class="status" id="statusBox">
+      <b>[System Status]</b><br>
+      Initializing Telemetry Stream...<br>
+      GPS Lock: Searching...<br>
+      LoRa Transceiver: Active
+    </div>
+  </div>
+
+  <script>
+    function sendCommand(cmd) {
+      fetch('/action?go=' + cmd)
+        .then(response => response.text())
+        .then(data => { document.getElementById('statusBox').innerHTML = "<b>[Telemetry Stream]</b><br>" + data; });
+    }
+    
+    // Auto-refresh telemetry every 3 seconds
+    setInterval(function() {
+      fetch('/telemetry')
+        .then(response => response.text())
+        .then(data => { document.getElementById('statusBox').innerHTML = "<b>[Telemetry Stream]</b><br>" + data; });
+    }, 3000);
+  </script>
+</body>
+</html>
+)rawliteral";
+
+// --- Server Route Handlers ---
+void handleRoot() {
+  server.send(200, "text/html", MAIN_PAGE);
 }
 
-void OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingData, int len) {
-  if (len == sizeof(IdentityMessage)) {
-    memcpy(&connectedRobot, incomingData, sizeof(connectedRobot));
-    strncpy(robotName, connectedRobot.name, sizeof(robotName));
-    lastResponseTime = millis();
+String getTelemetryPayload() {
+  String payload = "";
+  payload += "Mode: " + String(currentMode) + " | WiFi Clients: " + String(WiFi.softAPgetStationNum()) + "<br>";
+  payload += "GPS Sats: " + String(gps.satellites.value()) + " | Fix: " + String(gps.location.isValid() ? "YES" : "NO") + "<br>";
+  payload += "Lat: " + String(gps.location.lat(), 6) + " | Lng: " + String(gps.location.lng(), 6) + "<br>";
+  payload += "Solar Panel Angle: " + String(panelPos1) + "°<br>";
+  payload += "Gimbal Pan: " + String(gimbalHPos) + "° Tilt: " + String(gimbalVPos) + "°<br>";
+  payload += "LoRa Packet RSSI: " + String(LoRa.packetRssi());
+  return payload;
+}
+
+void handleTelemetryRequest() {
+  server.send(200, "text/plain", getTelemetryPayload());
+}
+
+void handleAction() {
+  String cmd = server.arg("go");
+
+  if (cmd == "forward") {
+    digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+    digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  } else if (cmd == "backward") {
+    digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
+    digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
+  } else if (cmd == "left") {
+    digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
+    digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  } else if (cmd == "right") {
+    digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+    digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
+  } else if (cmd == "stop") {
+    digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
+    digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
+  } else if (cmd == "panel_up") {
+    panelPos1 = min(180, panelPos1 + 15);
+    panelPos2 = min(180, panelPos2 + 15);
+    panelServo1.write(panelPos1);
+    panelServo2.write(panelPos2);
+  } else if (cmd == "panel_down") {
+    panelPos1 = max(0, panelPos1 - 15);
+    panelPos2 = max(0, panelPos2 - 15);
+    panelServo1.write(panelPos1);
+    panelServo2.write(panelPos2);
+  } else if (cmd == "gimbal_left") {
+    gimbalHPos = max(0, gimbalHPos - 15);
+    gimbalHServo.write(gimbalHPos);
+  } else if (cmd == "gimbal_right") {
+    gimbalHPos = min(180, gimbalHPos + 15);
+    gimbalHServo.write(gimbalHPos);
   }
+
+  server.send(200, "text/plain", getTelemetryPayload());
 }
 
+// --- Setup Routine ---
 void setup() {
   Serial.begin(115200);
+  Serial2.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX); // GP-01 GPS Initialization
 
-  pinMode(PIN_LED_TX, OUTPUT);
-  pinMode(PIN_LED_PWR, OUTPUT);
-  pinMode(PIN_LED_DIAG, OUTPUT);
+  // Pin Configurations
+  pinMode(ENA, OUTPUT);
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(BUZZER_PIN, OUTPUT);
+  analogWrite(ENA, 220); // Default PWM throttle
 
-  digitalWrite(PIN_LED_PWR, HIGH);
+  // Attach 4 Servos
+  panelServo1.attach(SERVO_PANEL_1);
+  panelServo2.attach(SERVO_PANEL_2);
+  gimbalHServo.attach(SERVO_GIMBAL_H);
+  gimbalVServo.attach(SERVO_GIMBAL_V);
 
-  pinMode(PIN_BTN_TL, INPUT_PULLUP);
-  pinMode(PIN_BTN_TR, INPUT_PULLUP);
-  pinMode(PIN_BTN_MODE, INPUT_PULLUP);
-  pinMode(PIN_BTN_MENU, INPUT_PULLUP);
+  // Initial Servo Positions
+  panelServo1.write(0);
+  panelServo2.write(0);
+  gimbalHServo.write(90);
+  gimbalVServo.write(90);
 
+  // OLED Display Initialization
   Wire.begin(21, 22);
-  if (display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+  if(!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+    Serial.println(F("SSD1306 allocation failed"));
+  } else {
     display.clearDisplay();
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
-    display.setCursor(0, 10);
-    display.println("CONTROLLER READY");
+    display.setCursor(0,0);
+    display.println(F("Mars Rover 2.0 Booting"));
     display.display();
   }
 
-  WiFi.mode(WIFI_STA);
-  if (esp_now_init() == ESP_OK) {
-    esp_now_register_send_cb(OnDataSent);
-    esp_now_register_recv_cb(OnDataRecv);
-
-    esp_now_peer_info_t peerInfo = {};
-    memcpy(peerInfo.peer_addr, broadcastAddress, 6);
-    peerInfo.channel = 0;  
-    peerInfo.encrypt = false;
-    
-    esp_now_add_peer(&peerInfo);
-  }
-
-  // --- LORA INITIALIZATION CODE (UNCOMMENT WHEN LORA MODULE ATTACHED) ---
-  /*
-  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_SS);
+  // LoRa Transceiver Setup
   LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
-  if (LoRa.begin(915E6)) { 
-    digitalWrite(PIN_LED_DIAG, HIGH); // White LED indicates LoRa initialization status
-    Serial.println("LoRa Radio Initialized!");
+  if (!LoRa.begin(433E6)) {
+    Serial.println("LoRa initialization failed!");
   } else {
-    Serial.println("LoRa Initialization Failed!");
+    Serial.println("LoRa transceiver online!");
+    LoRa.receive(); // Put LoRa into continuous listening mode
   }
-  */
+
+  // Access Point Initialization
+  WiFi.softAP("MarsRover-Enterprise", "12345678");
+  server.on("/", handleRoot);
+  server.on("/action", handleAction);
+  server.on("/telemetry", handleTelemetryRequest);
+  server.begin();
+  
+  Serial.println("Full Rover Systems Online & Operational!");
 }
 
+// --- Main Runtime Loop ---
 void loop() {
-  // Read Triggers
-  bool r2Pressed = (digitalRead(PIN_BTN_TR) == LOW); // Forward
-  bool l2Pressed = (digitalRead(PIN_BTN_TL) == LOW); // Backward
+  server.handleClient();
 
-  // Read Left Joystick VRx (GPIO 32)
-  int lxRaw = analogRead(PIN_JOY_L_X);
-  int deadzone = 800;
-  int lx = lxRaw - 2048;
-
-  bool steeringLeft = (lx < -deadzone);
-  bool steeringRight = (lx > deadzone);
-
-  // Simple string-based state construction
-  String cmdStr = "STOP";
-
-  if (r2Pressed && !l2Pressed) {
-    if (steeringLeft) cmdStr = "FORWARD_LEFT";
-    else if (steeringRight) cmdStr = "FORWARD_RIGHT";
-    else cmdStr = "FORWARD";
-  } 
-  else if (l2Pressed && !r2Pressed) {
-    if (steeringLeft) cmdStr = "BACK_LEFT";
-    else if (steeringRight) cmdStr = "BACK_RIGHT";
-    else cmdStr = "BACK";
-  } 
-  else if (steeringLeft) {
-    cmdStr = "LEFT";
-  } 
-  else if (steeringRight) {
-    cmdStr = "RIGHT";
+  // Stream incoming GPS characters into TinyGPS++ parser
+  while (Serial2.available() > 0) {
+    gps.encode(Serial2.read());
   }
 
-  cmdStr.toCharArray(outgoingCmd.cmd, sizeof(outgoingCmd.cmd));
-
-  // Send simplified message over ESP-NOW
-  esp_now_send(broadcastAddress, (uint8_t *)&outgoingCmd, sizeof(outgoingCmd));
-
-  // --- OPTIONAL LORA BROADCAST (UNCOMMENT WHEN MODULE ADDED) ---
-  /*
-  LoRa.beginPacket();
-  LoRa.write((uint8_t *)&outgoingCmd, sizeof(outgoingCmd));
-  LoRa.endPacket();
-  */
-
-  if (millis() - lastResponseTime > 2000) {
-    strcpy(robotName, "SEARCHING...");
+  // Check for incoming LoRa telemetry packets asynchronously
+  int packetSize = LoRa.parsePacket();
+  if (packetSize) {
+    String incomingLoRaPacket = "";
+    while (LoRa.available()) {
+      incomingLoRaPacket += (char)LoRa.read();
+    }
+    Serial.print("Received LoRa Command: ");
+    Serial.println(incomingLoRaPacket);
   }
 
-  // Display Status
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-  
-  display.setCursor(0, 0);
-  display.println("CONNECTED TO:");
+  // Mode Switch Pushbutton Debounce & Execution Logic
+  bool reading = digitalRead(BUTTON_PIN);
+  if (reading == LOW && lastButtonState == HIGH && millis() - lastButtonPress > 300) {
+    currentMode = (currentMode + 1) % 4;
+    lastButtonPress = millis();
+    
+    // Audio Confirmation Beep
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(100);
+    digitalWrite(BUZZER_PIN, LOW);
+    
+    Serial.print("Switched to Operation Mode: ");
+    Serial.println(currentMode);
+  }
+  lastButtonState = reading;
 
-  display.setCursor(0, 14);
-  display.println(robotName);
+  // Periodic OLED Dashboard Update
+  if (millis() - previousTelemetryMillis >= telemetryInterval) {
+    previousTelemetryMillis = millis();
 
-  display.setCursor(0, 32);
-  display.print("CMD: ");
-  display.println(outgoingCmd.cmd);
-
-  display.setCursor(0, 48);
-  display.print("ESP-NOW: ");
-  display.println(espNowSuccess ? "LINK OK" : "NO LINK");
-
-  display.display();
-
-  delay(30);
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.print(F("Mode: ")); display.println(currentMode);
+    display.print(F("Sats: ")); display.println(gps.satellites.value());
+    display.print(F("Lat: ")); display.println(gps.location.lat(), 4);
+    display.print(F("Lng: ")); display.println(gps.location.lng(), 4);
+    display.print(F("Panel: ")); display.print(panelPos1); display.println(F(" deg"));
+    display.display();
+  }
+}
 }
