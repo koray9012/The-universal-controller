@@ -90,7 +90,7 @@ The code can be found in repo: Universal controller code
 
 ## Very important: The motors came with the chasis because they are a kit and also the cables arent exacly 30 bc i cut them up and soldered them 
 
-## Video for controller demo ()
+## Video for controller demo (https://www.youtube.com/watch?v=LWRgiCwD7JM)
 
 ## Credits: 
 
