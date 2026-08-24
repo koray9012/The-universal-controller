@@ -1,304 +1,261 @@
 #include <WiFi.h>
-#include <WebServer.h>
-#include <ESP32Servo.h>
-#include <SPI.h>
-#include <LoRa.h>
-#include <TinyGPS++.h>
+#include <esp_now.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
-// --- System Pin Mapping & Configurations ---
-#define ENA             14
-#define IN1             27
-#define IN2             26
-#define IN3             25
-#define IN4             33
-#define BUTTON_PIN      4
-#define BUZZER_PIN      19
+// ==========================================
+// 📶 NETWORK & RECEIVER TARGET CONFIG
+// ==========================================
+// Replace with the MAC Address of your target ESP32 Rover / Receiver
+uint8_t receiverMac[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}; 
 
-// Servo Array Pins (4 Servos for Solar Panel Articulation & Gimbal Gimicks)
-#define SERVO_PANEL_1   13
-#define SERVO_PANEL_2   12
-#define SERVO_GIMBAL_H  23
-#define SERVO_GIMBAL_V  18
+// ==========================================
+// 📌 PIN DEFINITIONS
+// ==========================================
+#define PIN_JOY_L_X   32
+#define PIN_JOY_L_Y   33
+#define PIN_JOY_R_X   34
+#define PIN_JOY_R_Y   35
 
-// GPS Module (GP-01 BDS+GPS) Hardware Serial 2
-#define GPS_RX          16
-#define GPS_TX          17
+#define PIN_BTN_L2    4   // Fire Gel Blaster / Primary Trigger
+#define PIN_BTN_R2    13  // Alt Trigger / Special Action
+#define PIN_BTN_MODE  25  // Mode Switch (Auto / Manual Safe / Suicide / Diag)
+#define PIN_BTN_MENU  27  // Menu / Telemetry Toggle
 
-// LoRa SPI Bus Pin Mapping
-#define LORA_SCK        5
-#define LORA_MISO       19
-#define LORA_MOSI       27
-#define LORA_SS         18
-#define LORA_RST        14
-#define LORA_DIO0       26
+#define PIN_LED_TX    2   // Blue TX Status LED
+#define PIN_LED_PWR   17  // Green Power/Link LED
+#define PIN_LED_DIAG  16  // White Diagnostic LED
 
-// OLED Display Specs
-#define SCREEN_WIDTH    128
-#define SCREEN_HEIGHT   64
-#define OLED_RESET      -1
-#define SCREEN_ADDRESS  0x3C
+#define SCREEN_WIDTH  128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
-// --- Global Objects ---
-WebServer server(80);
-TinyGPSPlus gps;
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+// ==========================================
+// 📦 ESP-NOW PACKET STRUCTURES
+// ==========================================
+// Primary Universal Controller Packet Structure
+typedef struct ControllerPacket {
+  int16_t joyLX;
+  int16_t joyLY;
+  int16_t joyRX;
+  int16_t joyRY;
+  bool btnL2;         // Gel Blaster Firing Command
+  bool btnR2;
+  uint8_t driveMode;  // 0: Auto, 1: Manual+Safe, 2: Suicide, 3: Diag
+  uint32_t timestamp;
+} ControllerPacket;
 
-Servo panelServo1;
-Servo panelServo2;
-Servo gimbalHServo;
-Servo gimbalVServo;
+ControllerPacket txData;
 
-// --- State Machine & Telemetry Variables ---
-int currentMode = 0; // 0: Auto, 1: Manual+Safety, 2: Suicide, 3: Diagnostics
-unsigned long lastButtonPress = 0;
-bool lastButtonState = HIGH;
+// Secondary Glove Mouse Structure (for protocol bridging/emulation)
+typedef struct GlovePacket {
+  int speedLeft;     // -255 to 255
+  int speedRight;    // -255 to 255
+  bool lmb;          // Gel Blaster trigger equivalent
+  bool rmb;
+  bool mmb;
+  bool isFrozen;     
+} GlovePacket;
 
-int panelPos1 = 0;
-int panelPos2 = 0;
-int gimbalHPos = 90;
-int gimbalVPos = 90;
+GlovePacket gloveData;
 
-unsigned long previousTelemetryMillis = 0;
-const long telemetryInterval = 2000;
+// Telemetry ACK struct received back from vehicle
+typedef struct TelemetryPacket {
+  char robotName[32];
+  uint8_t batteryPercent;
+  bool linkAlive;
+} TelemetryPacket;
 
-// --- Embedded Web Dashboard UI (Full HTML/CSS/JS Payload) ---
-const char MAIN_PAGE[] PROGMEM = R"rawliteral(
-<!DOCTYPE html>
-<html>
-<head>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Mars Rover Full Command Hub</title>
-  <style>
-    body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; text-align: center; background: #0f172a; color: #f8fafc; margin: 0; padding: 15px; }
-    h2 { color: #38bdf8; margin-bottom: 5px; letter-spacing: 1px; }
-    .container { max-width: 450px; margin: auto; }
-    .panel-box { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 12px; margin-top: 12px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.3); }
-    .btn { background: #0ea5e9; color: white; padding: 14px 20px; font-size: 16px; font-weight: bold; margin: 6px; border: none; border-radius: 8px; cursor: pointer; width: 42%; transition: background 0.2s; }
-    .btn:active { background: #0284c7; }
-    .stop { background: #ef4444; width: 88%; }
-    .stop:active { background: #dc2626; }
-    .servo-btn { background: #10b981; width: 42%; }
-    .servo-btn:active { background: #059669; }
-    .status { background: #090d16; border: 1px solid #1e293b; padding: 14px; border-radius: 8px; margin-top: 15px; font-family: 'Courier New', Courier, monospace; font-size: 13px; text-align: left; color: #38bdf8; line-height: 1.4; }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <h2>MARS ROVER 2.0 HUD</h2>
-    <p style="font-size: 12px; color: #94a3b8;">ESP32 Advanced Telemetry & Motion Control</p>
-    
-    <div class="panel-box">
-      <h3>Drive Control</h3>
-      <button class="btn" onclick="sendCommand('forward')">▲ FWD</button><br>
-      <button class="btn" onclick="sendCommand('left')">◄ LEFT</button>
-      <button class="btn" onclick="sendCommand('right')">RIGHT ►</button><br>
-      <button class="btn" onclick="sendCommand('backward')">▼ REV</button><br><br>
-      <button class="btn stop" onclick="sendCommand('stop')">🛑 EMERGENCY STOP</button>
-    </div>
+TelemetryPacket rxTelemetry;
 
-    <div class="panel-box">
-      <h3>Solar Array & Gimbal Articulation</h3>
-      <button class="btn servo-btn" onclick="sendCommand('panel_up')">Panel Up (+)</button>
-      <button class="btn servo-btn" onclick="sendCommand('panel_down')">Panel Down (-)</button><br>
-      <button class="btn servo-btn" onclick="sendCommand('gimbal_left')">Gimbal ◄</button>
-      <button class="btn servo-btn" onclick="sendCommand('gimbal_right')">Gimbal ►</button>
-    </div>
+// ==========================================
+// ⚙️ GLOBALS & STATES
+// ==========================================
+bool screenOK = false;
+bool linkActive = false;
+unsigned long lastAckTime = 0;
+unsigned long lastTxTime = 0;
+unsigned long lastBtnPress = 0;
 
-    <div class="status" id="statusBox">
-      <b>[System Status]</b><br>
-      Initializing Telemetry Stream...<br>
-      GPS Lock: Searching...<br>
-      LoRa Transceiver: Active
-    </div>
-  </div>
+uint8_t currentMode = 1; // Default: Manual + Safety
+bool firingActive = false;
 
-  <script>
-    function sendCommand(cmd) {
-      fetch('/action?go=' + cmd)
-        .then(response => response.text())
-        .then(data => { document.getElementById('statusBox').innerHTML = "<b>[Telemetry Stream]</b><br>" + data; });
-    }
-    
-    // Auto-refresh telemetry every 3 seconds
-    setInterval(function() {
-      fetch('/telemetry')
-        .then(response => response.text())
-        .then(data => { document.getElementById('statusBox').innerHTML = "<b>[Telemetry Stream]</b><br>" + data; });
-    }, 3000);
-  </script>
-</body>
-</html>
-)rawliteral";
-
-// --- Server Route Handlers ---
-void handleRoot() {
-  server.send(200, "text/html", MAIN_PAGE);
+// --- ESP-NOW CALLBACKS ---
+void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  if (status == ESP_OK) {
+    digitalWrite(PIN_LED_TX, HIGH);
+    lastAckTime = millis();
+    linkActive = true;
+  } else {
+    digitalWrite(PIN_LED_TX, LOW);
+  }
 }
 
-String getTelemetryPayload() {
-  String payload = "";
-  payload += "Mode: " + String(currentMode) + " | WiFi Clients: " + String(WiFi.softAPgetStationNum()) + "<br>";
-  payload += "GPS Sats: " + String(gps.satellites.value()) + " | Fix: " + String(gps.location.isValid() ? "YES" : "NO") + "<br>";
-  payload += "Lat: " + String(gps.location.lat(), 6) + " | Lng: " + String(gps.location.lng(), 6) + "<br>";
-  payload += "Solar Panel Angle: " + String(panelPos1) + "°<br>";
-  payload += "Gimbal Pan: " + String(gimbalHPos) + "° Tilt: " + String(gimbalVPos) + "°<br>";
-  payload += "LoRa Packet RSSI: " + String(LoRa.packetRssi());
-  return payload;
+void OnDataRecv(const esp_now_recv_info_t *recv_info, const uint8_t *incomingData, int len) {
+  if (len == sizeof(TelemetryPacket)) {
+    memcpy(&rxTelemetry, incomingData, sizeof(rxTelemetry));
+    lastAckTime = millis();
+    linkActive = true;
+  }
 }
 
-void handleTelemetryRequest() {
-  server.send(200, "text/plain", getTelemetryPayload());
-}
+// ==========================================
+// 🖥️ UI & TELEMETRY DISPLAY
+// ==========================================
+void updateDisplay() {
+  if (!screenOK) return;
 
-void handleAction() {
-  String cmd = server.arg("go");
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
 
-  if (cmd == "forward") {
-    digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
-    digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
-  } else if (cmd == "backward") {
-    digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
-    digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
-  } else if (cmd == "left") {
-    digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
-    digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
-  } else if (cmd == "right") {
-    digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
-    digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
-  } else if (cmd == "stop") {
-    digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
-    digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
-  } else if (cmd == "panel_up") {
-    panelPos1 = min(180, panelPos1 + 15);
-    panelPos2 = min(180, panelPos2 + 15);
-    panelServo1.write(panelPos1);
-    panelServo2.write(panelPos2);
-  } else if (cmd == "panel_down") {
-    panelPos1 = max(0, panelPos1 - 15);
-    panelPos2 = max(0, panelPos2 - 15);
-    panelServo1.write(panelPos1);
-    panelServo2.write(panelPos2);
-  } else if (cmd == "gimbal_left") {
-    gimbalHPos = max(0, gimbalHPos - 15);
-    gimbalHServo.write(gimbalHPos);
-  } else if (cmd == "gimbal_right") {
-    gimbalHPos = min(180, gimbalHPos + 15);
-    gimbalHServo.write(gimbalHPos);
+  // Top Header: Link Status & Active Protocol Mode
+  display.setCursor(0, 0);
+  display.print("LINK: ");
+  display.print(linkActive ? "[ONLINE]" : "[OFFLINE]");
+
+  display.setCursor(80, 0);
+  if (currentMode == 0) display.print("AUTO");
+  else if (currentMode == 1) display.print("SAFE");
+  else if (currentMode == 2) display.print("SUICIDE");
+  else display.print("DIAG");
+
+  display.drawLine(0, 10, 128, 10, SSD1306_WHITE);
+
+  // Gel Blaster Firing Warning Bar
+  if (firingActive) {
+    display.fillRect(0, 14, 128, 14, SSD1306_WHITE);
+    display.setTextColor(SSD1306_BLACK);
+    display.setCursor(12, 17);
+    display.print("!!! FIRING BLASTER !!!");
+    display.setTextColor(SSD1306_WHITE);
+  } else {
+    display.setCursor(0, 17);
+    display.print("Target: ");
+    display.print(rxTelemetry.robotName[0] != '\0' ? rxTelemetry.robotName : "Rover AP");
   }
 
-  server.send(200, "text/plain", getTelemetryPayload());
+  // Joystick Input Visualizers
+  display.setCursor(0, 36);
+  display.print("L Stick: "); display.print(txData.joyLX); display.print(","); display.print(txData.joyLY);
+
+  display.setCursor(0, 48);
+  display.print("R Stick: "); display.print(txData.joyRX); display.print(","); display.print(txData.joyRY);
+
+  // Bottom Status Bar
+  int signalWidth = linkActive ? 124 : 0;
+  display.drawRect(0, 58, 128, 6, SSD1306_WHITE);
+  display.fillRect(2, 60, signalWidth, 2, SSD1306_WHITE);
+
+  display.display();
 }
 
-// --- Setup Routine ---
+// ==========================================
+// 🛠️ SETUP
+// ==========================================
 void setup() {
   Serial.begin(115200);
-  Serial2.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX); // GP-01 GPS Initialization
 
-  // Pin Configurations
-  pinMode(ENA, OUTPUT);
-  pinMode(IN1, OUTPUT);
-  pinMode(IN2, OUTPUT);
-  pinMode(IN3, OUTPUT);
-  pinMode(IN4, OUTPUT);
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
-  pinMode(BUZZER_PIN, OUTPUT);
-  analogWrite(ENA, 220); // Default PWM throttle
+  // Setup Switches and Triggers
+  pinMode(PIN_BTN_L2, INPUT_PULLUP);
+  pinMode(PIN_BTN_R2, INPUT_PULLUP);
+  pinMode(PIN_BTN_MODE, INPUT_PULLUP);
+  pinMode(PIN_BTN_MENU, INPUT_PULLUP);
 
-  // Attach 4 Servos
-  panelServo1.attach(SERVO_PANEL_1);
-  panelServo2.attach(SERVO_PANEL_2);
-  gimbalHServo.attach(SERVO_GIMBAL_H);
-  gimbalVServo.attach(SERVO_GIMBAL_V);
+  // Setup Indicator LEDs
+  pinMode(PIN_LED_TX, OUTPUT);
+  pinMode(PIN_LED_PWR, OUTPUT);
+  pinMode(PIN_LED_DIAG, OUTPUT);
 
-  // Initial Servo Positions
-  panelServo1.write(0);
-  panelServo2.write(0);
-  gimbalHServo.write(90);
-  gimbalVServo.write(90);
+  digitalWrite(PIN_LED_PWR, HIGH); // Power Indicator ON
 
-  // OLED Display Initialization
+  // Setup Display
   Wire.begin(21, 22);
-  if(!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
-    Serial.println(F("SSD1306 allocation failed"));
-  } else {
+  if (display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    screenOK = true;
     display.clearDisplay();
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
-    display.setCursor(0,0);
-    display.println(F("Mars Rover 2.0 Booting"));
+    display.setCursor(10, 20);
+    display.println("UNIVERSAL CTRL");
+    display.setCursor(10, 35);
+    display.println("BOOTING ESP-NOW...");
     display.display();
+    delay(500);
   }
 
-  // LoRa Transceiver Setup
-  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
-  if (!LoRa.begin(433E6)) {
-    Serial.println("LoRa initialization failed!");
-  } else {
-    Serial.println("LoRa transceiver online!");
-    LoRa.receive(); // Put LoRa into continuous listening mode
-  }
+  // Setup Wi-Fi for Peer-to-Peer ESP-NOW
+  WiFi.mode(WIFI_STA);
 
-  // Access Point Initialization
-  WiFi.softAP("MarsRover-Enterprise", "12345678");
-  server.on("/", handleRoot);
-  server.on("/action", handleAction);
-  server.on("/telemetry", handleTelemetryRequest);
-  server.begin();
-  
-  Serial.println("Full Rover Systems Online & Operational!");
+  if (esp_now_init() == ESP_OK) {
+    esp_now_register_send_cb(OnDataSent);
+    esp_now_register_recv_cb(OnDataRecv);
+
+    // Register Target Vehicle Peer
+    esp_now_peer_info_t peerInfo = {};
+    memcpy(peerInfo.peer_addr, receiverMac, 6);
+    peerInfo.channel = 0;
+    peerInfo.encrypt = false;
+    esp_now_add_peer(&peerInfo);
+  }
 }
 
-// --- Main Runtime Loop ---
+// ==========================================
+// 🔄 MAIN LOOP
+// ==========================================
 void loop() {
-  server.handleClient();
+  unsigned long now = millis();
 
-  // Stream incoming GPS characters into TinyGPS++ parser
-  while (Serial2.available() > 0) {
-    gps.encode(Serial2.read());
-  }
-
-  // Check for incoming LoRa telemetry packets asynchronously
-  int packetSize = LoRa.parsePacket();
-  if (packetSize) {
-    String incomingLoRaPacket = "";
-    while (LoRa.available()) {
-      incomingLoRaPacket += (char)LoRa.read();
-    }
-    Serial.print("Received LoRa Command: ");
-    Serial.println(incomingLoRaPacket);
-  }
-
-  // Mode Switch Pushbutton Debounce & Execution Logic
-  bool reading = digitalRead(BUTTON_PIN);
-  if (reading == LOW && lastButtonState == HIGH && millis() - lastButtonPress > 300) {
+  // Mode Toggle Debounce
+  if (digitalWrite(PIN_BTN_MODE) == LOW && (now - lastBtnPress > 300)) {
+    lastBtnPress = now;
     currentMode = (currentMode + 1) % 4;
-    lastButtonPress = millis();
-    
-    // Audio Confirmation Beep
-    digitalWrite(BUZZER_PIN, HIGH);
-    delay(100);
-    digitalWrite(BUZZER_PIN, LOW);
-    
-    Serial.print("Switched to Operation Mode: ");
-    Serial.println(currentMode);
   }
-  lastButtonState = reading;
 
-  // Periodic OLED Dashboard Update
-  if (millis() - previousTelemetryMillis >= telemetryInterval) {
-    previousTelemetryMillis = millis();
+  // Read Analog Joysticks
+  txData.joyLX = analogRead(PIN_JOY_L_X) - 2048; // Center normalized
+  txData.joyLY = analogRead(PIN_JOY_L_Y) - 2048;
+  txData.joyRX = analogRead(PIN_JOY_R_X) - 2048;
+  txData.joyRY = analogRead(PIN_JOY_R_Y) - 2048;
 
-    display.clearDisplay();
-    display.setCursor(0, 0);
-    display.print(F("Mode: ")); display.println(currentMode);
-    display.print(F("Sats: ")); display.println(gps.satellites.value());
-    display.print(F("Lat: ")); display.println(gps.location.lat(), 4);
-    display.print(F("Lng: ")); display.println(gps.location.lng(), 4);
-    display.print(F("Panel: ")); display.print(panelPos1); display.println(F(" deg"));
-    display.display();
+  // Read Triggers (Gel Blaster Firing Logic)
+  txData.btnL2 = (digitalRead(PIN_BTN_L2) == LOW);
+  txData.btnR2 = (digitalRead(PIN_BTN_R2) == LOW);
+  txData.driveMode = currentMode;
+  txData.timestamp = now;
+
+  firingActive = txData.btnL2;
+
+  // Populate Glove Emulation Data Struct for Cross-Compatibility Mode
+  gloveData.speedLeft = map(txData.joyLY + txData.joyLX, -2048, 2048, -255, 255);
+  gloveData.speedRight = map(txData.joyLY - txData.joyLX, -2048, 2048, -255, 255);
+  gloveData.lmb = txData.btnL2; // Trigger maps to left mouse click
+  gloveData.rmb = txData.btnR2;
+  gloveData.isFrozen = (currentMode == 3); // Diagnostics mode pauses motion
+
+  // Transmit Control Frame via ESP-NOW at 50Hz (Every 20ms)
+  if (now - lastTxTime >= 20) {
+    lastTxTime = now;
+    esp_now_send(receiverMac, (uint8_t *)&txData, sizeof(txData));
   }
+
+  // Turn off TX LED pulse
+  if (now - lastTxTime > 10) {
+    digitalWrite(PIN_LED_TX, LOW);
+  }
+
+  // Check Link Timeout Fail-safe (500ms heartbeat drop)
+  if (now - lastAckTime > 500) {
+    linkActive = false;
+    digitalWrite(PIN_LED_PWR, (now / 250) % 2 == 0 ? HIGH : LOW); // Blink Power LED on link loss
+  } else {
+    digitalWrite(PIN_LED_PWR, HIGH);
+  }
+
+  // Update Diagnostic / Telemetry Display
+  updateDisplay();
+
+  delay(5);
 }
 }
